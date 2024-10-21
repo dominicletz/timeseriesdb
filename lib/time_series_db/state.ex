@@ -3,7 +3,14 @@ defmodule TimeSeriesDB.State do
   @max_files_default 100
   alias TimeSeriesDB.State
 
-  defstruct [:compressor, :first_timestamp, :last_timestamp, :fp, :dirname, :timestamps, :size, :max_files]
+  defstruct [
+    :first_timestamp,
+    :last_timestamp,
+    :dirname,
+    :timestamps,
+    :size,
+    :max_files
+  ]
 
   defp compress(data), do: :ezstd.compress(data)
   defp decompress(data), do: :ezstd.decompress(data)
@@ -34,7 +41,13 @@ defmodule TimeSeriesDB.State do
           end
 
         _ ->
-          %State{state | timestamps: [], size: 0}
+          last_timestamp =
+            with {_first_timestamp, last_timestamp, _filename, _} <-
+                   List.first(list_all_logs(state)) do
+              last_timestamp
+            end
+
+          %State{state | timestamps: [], size: 0, last_timestamp: last_timestamp}
       end
 
     {:ok, state}
@@ -60,36 +73,35 @@ defmodule TimeSeriesDB.State do
     end
   end
 
-  def append_row(state, timestamp \\ nil, row) do
-    state = rotate_if_needed(state)
-
-    timestamp =
-      case timestamp do
-        nil ->
-          System.os_time(:nanosecond)
-
-        ts ->
-          if state.last_timestamp != nil and state.last_timestamp > ts do
-            raise(
-              "Timestamp #{inspect(ts)} is not monotonic! Must be greater than #{inspect(state.last_timestamp)}"
-            )
-          end
-
-          ts
-      end
-
-    est_size = byte_size(:erlang.term_to_binary(row)) + 20
-
-    %{
-      state
-      | first_timestamp: state.first_timestamp || timestamp,
-        last_timestamp: timestamp,
-        timestamps: [{timestamp, row} | state.timestamps],
-        size: state.size + est_size
-    }
+  def append_row!(state, timestamp \\ nil, row) do
+    case append_row(state, timestamp, row) do
+      {:ok, state} -> state
+      {:error, reason} -> raise reason
+    end
   end
 
-  def query_range(state, from, to) do
+  def append_row(state, timestamp \\ nil, row) do
+    timestamp = timestamp || System.os_time(:nanosecond)
+
+    if state.last_timestamp != nil and state.last_timestamp > timestamp do
+      {:error,
+       "Timestamp #{inspect(timestamp)} is not monotonic! Must be greater than #{inspect(state.last_timestamp)}"}
+    else
+      state = rotate_if_needed(state)
+      est_size = byte_size(:erlang.term_to_binary(row)) + 20
+
+      {:ok,
+       %{
+         state
+         | first_timestamp: state.first_timestamp || timestamp,
+           last_timestamp: timestamp,
+           timestamps: [{timestamp, row} | state.timestamps],
+           size: state.size + est_size
+       }}
+    end
+  end
+
+  def query_range(state, from, to) when from <= to do
     list_all_logs(state)
     |> Enum.reverse()
     |> Enum.filter(fn {first_timestamp, last_timestamp, _filename, _} ->
@@ -138,8 +150,13 @@ defmodule TimeSeriesDB.State do
 
   def count_files(state) do
     list_all_logs(state)
-    |> Enum.map(fn {_first_timestamp, _last_timestamp, filename, open_fn} ->
-      {filename, length(open_fn.())}
+    |> Enum.map(fn {first_timestamp, last_timestamp, filename, open_fn} ->
+      %{
+        filename: filename,
+        count: length(open_fn.()),
+        first_timestamp: first_timestamp,
+        last_timestamp: last_timestamp
+      }
     end)
   end
 

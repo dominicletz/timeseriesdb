@@ -4,6 +4,25 @@ defmodule TimeSeriesDBTest do
 
   alias TimeSeriesDB.State
 
+  setup do
+    File.rm_rf!("testdata/test_db")
+    :ok
+  end
+
+  test "wrong continue" do
+    {:ok, state} = State.init("testdata/test_db")
+
+    _state =
+      Enum.reduce(1..20_000, state, fn x, state ->
+        State.append_row!(state, x, %{x: x, z: String.duplicate("hello", 100)})
+      end)
+
+    {:ok, state} = State.init("testdata/test_db")
+
+    # should throw with an monotonic error
+    {:error, _msg} = State.append_row(state, 1, %{x: 1, z: String.duplicate("hello", 100)})
+  end
+
   test "backend test" do
     File.rm_rf!("testdata/test_1")
     {:ok, state} = TimeSeriesDB.State.init("testdata/test_1")
@@ -16,7 +35,7 @@ defmodule TimeSeriesDBTest do
     state =
       if State.count(state) == 0 do
         Enum.reduce(1..100_000, state, fn x, state ->
-          State.append_row(state, x, make_element.(x))
+          State.append_row!(state, x, make_element.(x))
         end)
       else
         state
