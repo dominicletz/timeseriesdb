@@ -1,15 +1,16 @@
 defmodule TimeSeriesDB.State do
   @chunk_size 5_000_000
-  @max_files 100
+  @max_files_default 100
   alias TimeSeriesDB.State
 
-  defstruct [:compressor, :first_timestamp, :last_timestamp, :fp, :dirname, :timestamps, :size]
+  defstruct [:compressor, :first_timestamp, :last_timestamp, :fp, :dirname, :timestamps, :size, :max_files]
 
   defp compress(data), do: :ezstd.compress(data)
   defp decompress(data), do: :ezstd.decompress(data)
 
-  def init(dirname, _opts \\ []) do
-    state = %State{dirname: dirname}
+  def init(dirname, opts \\ []) do
+    max_files = Keyword.get(opts, :max_files, @max_files_default)
+    state = %State{dirname: dirname, max_files: max_files}
     File.mkdir_p!(dirname)
 
     state =
@@ -185,7 +186,7 @@ defmodule TimeSeriesDB.State do
     File.ls!(state.dirname)
     |> Enum.sort(:desc)
     |> Enum.filter(&String.starts_with?(&1, prefix))
-    |> Enum.drop(@max_files)
+    |> Enum.drop(state.max_files)
     |> Enum.each(&File.rm/1)
   end
 

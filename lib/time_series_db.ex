@@ -4,10 +4,11 @@ defmodule TimeSeriesDB do
   use GenServer
 
   def start_link(filename, opts \\ []) do
-    GenServer.start_link(__MODULE__, filename, opts)
+    {opts, gen_opts} = Keyword.split(opts, [:max_files])
+    GenServer.start_link(__MODULE__, {filename, opts}, gen_opts)
   end
 
-  def init(filename), do: State.init(filename)
+  def init({filename, opts}), do: State.init(filename, opts)
   def append_row(pid, key, value), do: GenServer.cast(pid, {:append_row, key, value})
   def query_range(pid, from, to), do: GenServer.call(pid, {:query_range, from, to})
   def query_multiple(pid, keys), do: GenServer.call(pid, {:query_multiple, keys})
