@@ -6,7 +6,7 @@ defmodule TimeSeriesDB do
   @max_size 10_000_000
   @max_files 100
 
-  defstruct [:cmd, :first_timestamp, :last_timestamp, :fp, :filename, :timestamps]
+  defstruct [:cmd, :first_timestamp, :last_timestamp, :fp, :filename, :timestamps, :size]
 
   @compress_cmds [
                    {"zstd", ["--rm"], ".zst"},
@@ -16,40 +16,38 @@ defmodule TimeSeriesDB do
                  |> Enum.map(fn {cmd, args, ext} -> %{cmd: cmd, args: args, ext: ext} end)
 
   def init(filename, _opts \\ []) do
-    {first_timestamp, last_timestamp, timestamps} =
-      if File.exists?(filename) do
-        {:ok, fp} = :file.open(filename, [:read, :binary])
-        timestamps = read_timestamps(fp)
-        :file.close(fp)
+    {first_timestamp, last_timestamp, timestamps, size} =
+      case File.stat(filename) do
+        {:ok, %{size: size}} when size > 0 ->
+          timestamps = read_file(filename)
 
-        if timestamps == [] do
-          {nil, nil, []}
-        else
-          first_timestamp = timestamps |> List.first() |> elem(0)
-          last_timestamp = timestamps |> List.last() |> elem(0)
-          {first_timestamp, last_timestamp, timestamps}
-        end
-      else
-        {nil, nil, []}
+          if timestamps == [] do
+            {nil, nil, [], 0}
+          else
+            first_timestamp = timestamps |> List.first() |> elem(0)
+            last_timestamp = timestamps |> List.last() |> elem(0)
+            {first_timestamp, last_timestamp, timestamps, size}
+          end
+
+        _ ->
+          {nil, nil, [], 0}
       end
 
-    {:ok, fp} = :file.open(filename, [:append, :write, :binary, :delayed_write])
+    cmd = Enum.find_value(@compress_cmds, fn cmd ->
+      if full_path = System.find_executable(cmd.cmd) do
+        %{cmd | cmd: full_path}
+      end
+    end) || raise("No compression tool found")
 
     {:ok,
      %TimeSeriesDB{
-       cmd:
-         Enum.find(@compress_cmds, fn cmd -> System.find_executable(cmd.cmd) end) ||
-           raise("No compression tool found"),
+       cmd: cmd,
        first_timestamp: first_timestamp,
        last_timestamp: last_timestamp,
-       fp: fp,
        filename: filename,
+       size: size,
        timestamps: Enum.reverse(timestamps)
      }}
-  end
-
-  def close(%TimeSeriesDB{fp: fp}) do
-    :file.close(fp)
   end
 
   def oldest(state) do
@@ -82,17 +80,14 @@ defmodule TimeSeriesDB do
           ts
       end
 
-    data = :erlang.term_to_binary(row)
-    size = byte_size(data)
-
-    pos = :file.position(state.fp, :cur)
-    :file.write(state.fp, <<timestamp::unsigned-size(64), size::unsigned-size(32), data::binary>>)
+    est_size = byte_size(:erlang.term_to_binary(row)) + 20
 
     %{
       state
       | first_timestamp: state.first_timestamp || timestamp,
         last_timestamp: timestamp,
-        timestamps: [{timestamp, {pos + 12, size}} | state.timestamps]
+        timestamps: [{timestamp, row} | state.timestamps],
+        size: state.size + est_size
     }
   end
 
@@ -101,24 +96,9 @@ defmodule TimeSeriesDB do
     |> Enum.filter(fn {first_timestamp, last_timestamp, _filename, _} ->
       first_timestamp <= to and from <= last_timestamp
     end)
-    |> Enum.flat_map(fn {_first_timestamp, _last_timestamp, filename, open_fn} ->
-      {:ok, fp} = open_fn.()
-      timestamps = maybe_read_timestamps(state, filename, fp)
-
-      ret =
-        timestamps
-        |> Enum.drop_while(fn {timestamp, _} -> timestamp < from end)
-        |> Enum.reduce_while([], fn {timestamp, {loc, size}}, acc ->
-          if timestamp <= to do
-            {:ok, data} = :file.pread(fp, loc, size)
-            {:cont, [{timestamp, :erlang.binary_to_term(data)} | acc]}
-          else
-            {:halt, acc}
-          end
-        end)
-
-      :file.close(fp)
-      Enum.reverse(ret)
+    |> Enum.flat_map(fn {_first_timestamp, _last_timestamp, _filename, open_fn} ->
+      open_fn.()
+      |> Enum.filter(fn {timestamp, _} -> from <= timestamp and timestamp <= to end)
     end)
   end
 
@@ -139,19 +119,8 @@ defmodule TimeSeriesDB do
         end
       end)
       |> Enum.flat_map(fn {{_first_timestamp, _last_timestamp, _filename, open_fn}, keys} ->
-        {:ok, fp} = open_fn.()
-        timestamps = read_timestamps(fp) |> Map.new()
-
-        ret =
-          Enum.map(keys, fn key ->
-            with {loc, size} <- Map.get(timestamps, key) do
-              {:ok, data} = :file.pread(fp, loc, size)
-              {key, :erlang.binary_to_term(data)}
-            end
-          end)
-
-        :file.close(fp)
-        ret
+        timestamps = open_fn.() |> Map.new()
+        Enum.map(keys, fn key -> {key, Map.get(timestamps, key)} end)
       end)
       |> Map.new()
 
@@ -163,10 +132,7 @@ defmodule TimeSeriesDB do
   def count(state) do
     list_all_logs(state)
     |> Enum.map(fn {_first_timestamp, _last_timestamp, _filename, open_fn} ->
-      {:ok, fp} = open_fn.()
-      timestamps = read_timestamps(fp, 0)
-      :file.close(fp)
-      length(timestamps)
+      length(open_fn.())
     end)
     |> Enum.sum()
   end
@@ -174,54 +140,43 @@ defmodule TimeSeriesDB do
   def count_files(state) do
     list_all_logs(state)
     |> Enum.map(fn {_first_timestamp, _last_timestamp, filename, open_fn} ->
-      {:ok, fp} = open_fn.()
-      timestamps = read_timestamps(fp, 0)
-      :file.close(fp)
-      {filename, length(timestamps)}
+      {filename, length(open_fn.())}
     end)
   end
 
   defp rotate_if_needed(state) do
-    with {:ok, size} when size > @max_size <- :file.position(state.fp, :cur) do
+    if state.size > @max_size do
       rotate_log(state)
     else
-      _ -> state
+      state
     end
+  end
+
+  def flush(state) do
+    File.write!(state.filename, :erlang.term_to_binary(Enum.reverse(state.timestamps)))
+  end
+
+  defp read_file(filename) do
+    :erlang.binary_to_term(File.read!(filename))
   end
 
   defp rotate_log(state) do
-    :file.close(state.fp)
-    compressed_name = "#{state.filename}.#{state.first_timestamp}-#{state.last_timestamp}"
-    File.rename(state.filename, compressed_name)
+    flush(state)
+    base_name = "#{state.filename}.#{state.first_timestamp}-#{state.last_timestamp}"
+    raw_name = base_name <> ".raw"
+    File.rename(state.filename, raw_name)
 
     spawn(fn ->
-      System.cmd(state.cmd.cmd, state.cmd.args ++ [compressed_name])
+      random = Base.encode32(:rand.bytes(10), case: :lower)
+      tmpnam = "tmp.#{random}"
+      compressor = state.cmd
+      System.cmd(compressor.cmd, compressor.args ++ ["-o", tmpnam, raw_name])
+      File.rename(tmpnam, base_name <> compressor.ext)
+      File.rm(raw_name)
       delete_old_logs(state)
     end)
 
-    {:ok, fp} = :file.open(state.filename, [:write, :binary, :delayed_write])
-    %{state | fp: fp, first_timestamp: nil, last_timestamp: nil}
-  end
-
-  defp read_timestamps(fp) do
-    read_timestamps(fp, 0)
-  end
-
-  defp read_timestamps(fp, loc) do
-    case :file.pread(fp, loc, 12) do
-      {:ok, <<timestamp::unsigned-size(64), size::unsigned-size(32)>>} ->
-        [{timestamp, {loc + 12, size}} | read_timestamps(fp, loc + 12 + size)]
-
-      {:ok, ""} ->
-        []
-
-      :eof ->
-        []
-    end
-  end
-
-  defp read_blob(<<timestamp::unsigned-size(64), size::unsigned-size(32), bin::binary-size(size), rest::binary()>>) do
-    [{timestamp, :erlang.binary_to_term(bin)} | read_blob(rest)]
+    %{state | first_timestamp: nil, last_timestamp: nil, size: 0, timestamps: []}
   end
 
   defp delete_old_logs(state) do
@@ -255,7 +210,7 @@ defmodule TimeSeriesDB do
     if state.first_timestamp != nil do
       now =
         {state.first_timestamp, state.last_timestamp, :state,
-         fn -> :file.open(state.filename, [:read, :binary]) end}
+         fn -> Enum.reverse(state.timestamps) end}
 
       [now | list_logs(state)]
     else
@@ -271,23 +226,7 @@ defmodule TimeSeriesDB do
         raise("No decompressor found for #{inspect(filename)}")
 
     {file, 0} = System.cmd(cmd.cmd, ["-dc", filename])
-    :file.open(file, [:read, :binary, :ram])
-  end
-
-  defp maybe_read_timestamps(state, :state, _fp, _loc) do
-    Enum.reverse(state.timestamps)
-  end
-
-  defp maybe_read_timestamps(_state, filename, fp, loc) do
-    read_timestamps(fp, loc)
-
-    # if File.exists?(filename <> ".timestamps") do
-    #   File.read!(filename <> ".timestamps") |> :erlang.binary_to_term()
-    # else
-    #   tps = read_timestamps(fp, loc)
-    #   File.write!(filename <> ".timestamps", :erlang.term_to_binary(tps, [:compressed]))
-    #   tps
-    # end
+    :erlang.binary_to_term(file)
   end
 end
 
@@ -308,15 +247,24 @@ state =
     state
   end
 
-# TimeSeriesDB.close(state)
+TimeSeriesDB.flush(state)
 
 1 = TimeSeriesDB.oldest(state)
 100_000 = TimeSeriesDB.newest(state)
 100_000 = TimeSeriesDB.count(state)
 
-[{1, one}] = TimeSeriesDB.query_range(state, 1, 1)
+[] = TimeSeriesDB.query_range(state, 0, 0)
+[{1, one}] = TimeSeriesDB.query_range(state, 0, 1)
+[{1, ^one}] = TimeSeriesDB.query_range(state, 1, 1)
+[{1, ^one}] = TimeSeriesDB.query_range(state, 0.1, 1.9)
+
 [^one] = TimeSeriesDB.query_multiple(state, [1])
 [{2, _two}] = TimeSeriesDB.query_range(state, 2, 2)
+
+range = [1, 10, 100, 1000, 10_000, 100_000]
+test = Enum.map(range, make_element)
+^test = TimeSeriesDB.query_multiple(state, range)
+[nil, nil, nil | ^test] = TimeSeriesDB.query_multiple(state, [1.5, 10.1, 100.2 | range])
 
 [{100_000, one}] = TimeSeriesDB.query_range(state, 100_000, 100_000)
 [^one] = TimeSeriesDB.query_multiple(state, [100_000])
@@ -327,12 +275,20 @@ state =
 
 :timer.tc(fn -> TimeSeriesDB.query_range(state, 80_000, 85_000) end) |> elem(0) |> IO.inspect()
 :timer.tc(fn -> TimeSeriesDB.query_range(state, 80_000, 85_000) end) |> elem(0) |> IO.inspect()
+:timer.tc(fn -> TimeSeriesDB.query_range(state, 80_000, 85_000) end) |> elem(0) |> IO.inspect()
+:timer.tc(fn -> TimeSeriesDB.query_range(state, 80_000, 85_000) end) |> elem(0) |> IO.inspect()
+:timer.tc(fn -> TimeSeriesDB.query_range(state, 80_000, 85_000) end) |> elem(0) |> IO.inspect()
 
 :timer.tc(fn -> TimeSeriesDB.query_range(state, 33_000, 38_000) end) |> elem(0) |> IO.inspect()
 :timer.tc(fn -> TimeSeriesDB.query_range(state, 33_000, 38_000) end) |> elem(0) |> IO.inspect()
 
-:timer.tc(fn -> TimeSeriesDB.query_multiple(state, [1, 10, 100, 1000, 10_000, 100_000]) end) |> elem(0) |> IO.inspect()
-:timer.tc(fn -> TimeSeriesDB.query_multiple(state, [1, 10, 100, 1000, 10_000, 100_000]) end) |> elem(0) |> IO.inspect()
+:timer.tc(fn -> TimeSeriesDB.query_multiple(state, [1, 10, 100, 1000, 10_000, 100_000]) end)
+|> elem(0)
+|> IO.inspect()
 
-# Profiler.fprof(fn -> TimeSeriesDB.query_range(state, 90_000, 95_000) end)
-# Profiler.fprof(fn -> TimeSeriesDB.query_multiple(state, [1, 10, 100, 1000, 10_000, 100_000]) end)
+:timer.tc(fn -> TimeSeriesDB.query_multiple(state, [1, 10, 100, 1000, 10_000, 100_000]) end)
+|> elem(0)
+|> IO.inspect()
+
+# Profiler.fprof(fn -> TimeSeriesDB.query_range(state, 80_000, 85_000) end)
+Profiler.fprof(fn -> TimeSeriesDB.query_multiple(state, [1, 10, 100, 1000, 10_000, 100_000]) end)
