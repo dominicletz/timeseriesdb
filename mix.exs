@@ -41,7 +41,7 @@ defmodule Timeseriesdb.MixProject do
     [
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:benchee, "~> 1.0", only: :dev},
-      {:dets_plus, "~> 1.0", only: :dev},
+      {:dets_plus, "~> 2.0", only: :dev},
       {:ezstd, "~> 1.0"}
     ]
   end
