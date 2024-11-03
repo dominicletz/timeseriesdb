@@ -53,8 +53,25 @@ defmodule TimeSeriesDB do
   :ok
   ```
   """
-  def append_row(pid, key, value) when is_integer(key),
-    do: GenServer.cast(pid, {:append_row, key, value})
+  def append_row(pid, key, value) when is_integer(key) do
+    GenServer.cast(pid, {:append_row, key, value})
+  end
+
+  @doc """
+  Appends a row to the database. Same as `append_row(pid, value)`, but with a nanosecond timestamp as default key.
+
+  ## Examples
+
+  ```elixir
+  iex> {:ok, pid} = TimeSeriesDB.start_link("testdata/test_db", max_files: 2)
+  iex> TimeSeriesDB.append_row(pid, %{x: 1, y: 2, z: "hello"})
+  :ok
+  ```
+  """
+  def append_row(pid, value) do
+    key = System.os_time(:nanosecond)
+    GenServer.cast(pid, {:append_row, key, value})
+  end
 
   @doc """
   Queries a range of rows from the database.
